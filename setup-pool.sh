@@ -20,6 +20,8 @@ UNIT_DIR=/etc/systemd/system
 TAG="# managed-by: pool-setup"
 EXPORTS_FILE=/etc/exports.d/pool-node.exports
 WATCH_BIN=/usr/local/libexec/pool-branch-watch
+MOUNTD_DROPIN_DIR=/etc/systemd/system/nfs-server.service.d
+MOUNTD_DROPIN=pool-mountd.conf
 # soft: 相手が応答しないとき、無期限に待たずにエラーを返す（監視サービスが切り離すまでのつなぎ）
 BRANCH_MOUNT_OPTS="rw,vers=4.2,soft,timeo=30,retrans=2,noatime,_netdev"
 
@@ -162,13 +164,26 @@ setup_export() {
     setsebool -P nfs_export_all_rw on
   fi
   open_firewall
+  # nfs-server と一緒に nfs-mountd（公開先の判定）を必ず起動する。
+  # Fedora 45 の nfs-utils では nfs-server だけが起動し、mountd が動かずにマウントが固まった
+  mkdir -p "$MOUNTD_DROPIN_DIR"
+  cat >"$MOUNTD_DROPIN_DIR/$MOUNTD_DROPIN" <<EOF
+$TAG
+[Unit]
+Wants=nfs-mountd.service
+After=nfs-mountd.service
+EOF
+  systemctl daemon-reload
   systemctl enable --now nfs-server
+  systemctl start nfs-mountd
+  systemctl is-active -q nfs-mountd || die "nfs-mountd を起動できませんでした（journalctl -u nfs-mountd を確認してください）"
   exportfs -ra
   ok "提供中: $DISK_DIR → $(export_targets | paste -sd' ')"
 }
 
 # 以前ストレージを提供していて、使うだけに変えた PC の公開設定を外す
 remove_export() {
+  rm -f "$MOUNTD_DROPIN_DIR/$MOUNTD_DROPIN"
   if [[ -f $EXPORTS_FILE ]]; then
     rm -f "$EXPORTS_FILE"
     exportfs -ra 2>/dev/null || true
@@ -186,11 +201,15 @@ setup_branches() {
   log "他の PC のディスクをマウントします"
   # 自分のディスクはローカルで直接使う（使うだけの PC はディスクを束ねない）
   if [[ $ROLE == storage ]]; then BRANCHES=("$DISK_DIR/$DATA_SUBDIR"); else BRANCHES=(); fi
-  local n mp u
+  local n mp u addr
   while read -r n; do
     mp="$BRANCH_BASE/$n"
     mkdir -p "$mp"
     u=$(unit_name "$mp" mount)
+    # addr=: Fedora 45 では mount が mount.nfs4 を通さずカーネルに直接頼むことがあり、
+    # そのときサーバーの IP が渡らず「mount program didn't pass remote address」で失敗する
+    addr=$(getent ahostsv4 "$n" 2>/dev/null | awk 'NR==1{print $1}') || true
+    addr=${addr:-$n}
     cat >"$UNIT_DIR/$u" <<EOF
 $TAG
 [Unit]
@@ -202,7 +221,7 @@ After=network-online.target
 What=$n:$DISK_DIR
 Where=$mp
 Type=nfs4
-Options=$BRANCH_MOUNT_OPTS
+Options=$BRANCH_MOUNT_OPTS,addr=$addr
 TimeoutSec=30
 
 [Install]
@@ -382,7 +401,8 @@ cmd_uninstall() {
   done
   for u in "${units[@]}"; do systemctl disable --now "$u" 2>/dev/null || true; done
   for u in "${units[@]}"; do rm -f "$UNIT_DIR/$u"; done
-  rm -f "$WATCH_BIN"
+  rm -f "$WATCH_BIN" "$MOUNTD_DROPIN_DIR/$MOUNTD_DROPIN"
+  rmdir "$MOUNTD_DROPIN_DIR" 2>/dev/null || true
   systemctl daemon-reload
   rm -f "$EXPORTS_FILE"
   exportfs -ra 2>/dev/null || true
